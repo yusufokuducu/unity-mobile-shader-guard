@@ -53,9 +53,11 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
 
             string csvPath = Path.Combine(logDir, "MobileShaderGuardAudit.csv");
             string mdPath = Path.Combine(logDir, "MobileShaderGuardAudit.md");
+            string jsonPath = Path.Combine(logDir, "MobileShaderGuardMcpReport.json");
 
             File.WriteAllText(csvPath, MobileHlslStaticAnalyzer.ExportAuditResultsToCsv(results), Encoding.UTF8);
             File.WriteAllText(mdPath, MobileHlslStaticAnalyzer.ExportAuditResultsToMarkdown(results), Encoding.UTF8);
+            File.WriteAllText(jsonPath, MobileShaderGuardMcpBridge.ExportAuditReportToJson(results), Encoding.UTF8);
 
             int criticalCount = 0;
             for (int i = 0; i < results.Count; i++)
@@ -65,6 +67,25 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
             }
 
             Debug.Log($"[MobileShaderGuard CI] Audited {results.Count} shader files ({criticalCount} Critical). Reports saved to {logDir}");
+        }
+
+        /// <summary>
+        /// MCP / AI Agent batchmode entrypoint outputting structured JSON diagnostics & heatmap summary:
+        /// unity -batchmode -quit -projectPath . -executeMethod YusufOkuducu.MobileShaderGuard.Editor.MobileShaderGuardCli.RunMcpAuditJson
+        /// </summary>
+        public static string RunMcpAuditJson(string rootDirectory = "Assets")
+        {
+            List<ShaderSourceAuditResult> results = ScanDirectoryShaders(rootDirectory);
+            string json = MobileShaderGuardMcpBridge.ExportAuditReportToJson(results);
+
+            string logDir = Path.Combine(Directory.GetCurrentDirectory(), "Logs");
+            if (!Directory.Exists(logDir))
+                Directory.CreateDirectory(logDir);
+
+            string jsonPath = Path.Combine(logDir, "MobileShaderGuardMcpReport.json");
+            File.WriteAllText(jsonPath, json, Encoding.UTF8);
+            Debug.Log($"[MobileShaderGuard MCP] Exported structured JSON audit ({results.Count} shaders) to {jsonPath}");
+            return json;
         }
     }
 }

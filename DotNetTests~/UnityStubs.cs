@@ -48,6 +48,29 @@ namespace UnityEngine
         public Vector2(float x, float y) { this.x = x; this.y = y; }
     }
 
+    public struct Color
+    {
+        public float r, g, b, a;
+        public Color(float r, float g, float b, float a = 1f)
+        {
+            this.r = r;
+            this.g = g;
+            this.b = b;
+            this.a = a;
+        }
+        public static Color white => new Color(1f, 1f, 1f, 1f);
+        public static Color black => new Color(0f, 0f, 0f, 1f);
+        public static Color gray => new Color(0.5f, 0.5f, 0.5f, 1f);
+    }
+
+    public static class Mathf
+    {
+        public static float Clamp01(float v) => v < 0f ? 0f : (v > 1f ? 1f : v);
+        public static int Clamp(int v, int min, int max) => v < min ? min : (v > max ? max : v);
+        public static float Max(float a, float b) => a > b ? a : b;
+        public static int Max(int a, int b) => a > b ? a : b;
+    }
+
     public static class JsonUtility
     {
         public static string ToJson(object obj, bool prettyPrint = false) => "{}";
@@ -131,6 +154,7 @@ namespace UnityEditor
     public class EditorWindow : UnityEngine.ScriptableObject
     {
         public UnityEngine.Vector2 minSize { get; set; }
+        public UnityEngine.UIElements.VisualElement rootVisualElement { get; } = new UnityEngine.UIElements.VisualElement();
         public static T GetWindow<T>(string title) where T : EditorWindow, new() => new T();
         public void Show() { }
         public void Repaint() { }
@@ -231,5 +255,171 @@ namespace UnityEditor.Rendering
     public interface IPreprocessShaders : Build.IOrderedCallback
     {
         void OnProcessShader(UnityEngine.Shader shader, ShaderSnippetData snippet, IList<ShaderCompilerData> data);
+    }
+}
+
+namespace UnityEngine.UIElements
+{
+    public enum FlexDirection { Column, ColumnReverse, Row, RowReverse }
+    public enum Align { Auto, FlexStart, Center, FlexEnd, Stretch }
+    public enum Justify { FlexStart, Center, FlexEnd, SpaceBetween, SpaceAround }
+    public enum Wrap { NoWrap, Wrap, WrapReverse }
+    public enum WhiteSpace { Normal, NoWrap }
+    public enum HelpBoxMessageType { None, Info, Warning, Error }
+
+    public struct Length
+    {
+        public float value { get; set; }
+        public Length(float value) { this.value = value; }
+        public static Length Percent(float value) => new Length(value);
+        public static implicit operator Length(float v) => new Length(v);
+    }
+
+    public struct StyleLength
+    {
+        public Length value { get; set; }
+        public StyleLength(Length v) { value = v; }
+        public StyleLength(float v) { value = new Length(v); }
+        public static implicit operator StyleLength(float v) => new StyleLength(v);
+        public static implicit operator StyleLength(Length v) => new StyleLength(v);
+    }
+
+    public struct StyleFloat
+    {
+        public float value { get; set; }
+        public StyleFloat(float v) { value = v; }
+        public static implicit operator StyleFloat(float v) => new StyleFloat(v);
+    }
+
+    public struct StyleColor
+    {
+        public UnityEngine.Color value { get; set; }
+        public StyleColor(UnityEngine.Color c) { value = c; }
+        public static implicit operator StyleColor(UnityEngine.Color c) => new StyleColor(c);
+    }
+
+    public struct StyleEnum<T> where T : struct, Enum
+    {
+        public T value { get; set; }
+        public StyleEnum(T v) { value = v; }
+        public static implicit operator StyleEnum<T>(T v) => new StyleEnum<T>(v);
+    }
+
+    public sealed class IStyle
+    {
+        public StyleEnum<FlexDirection> flexDirection { get; set; }
+        public StyleEnum<Align> alignItems { get; set; }
+        public StyleEnum<Justify> justifyContent { get; set; }
+        public StyleEnum<Wrap> flexWrap { get; set; }
+        public StyleFloat flexGrow { get; set; }
+        public StyleFloat flexShrink { get; set; }
+        public StyleLength width { get; set; }
+        public StyleLength height { get; set; }
+        public StyleLength minWidth { get; set; }
+        public StyleLength minHeight { get; set; }
+        public StyleLength maxHeight { get; set; }
+        public StyleLength marginTop { get; set; }
+        public StyleLength marginBottom { get; set; }
+        public StyleLength marginLeft { get; set; }
+        public StyleLength marginRight { get; set; }
+        public StyleLength paddingTop { get; set; }
+        public StyleLength paddingBottom { get; set; }
+        public StyleLength paddingLeft { get; set; }
+        public StyleLength paddingRight { get; set; }
+        public StyleLength borderTopWidth { get; set; }
+        public StyleLength borderBottomWidth { get; set; }
+        public StyleLength borderLeftWidth { get; set; }
+        public StyleLength borderRightWidth { get; set; }
+        public StyleLength borderTopLeftRadius { get; set; }
+        public StyleLength borderTopRightRadius { get; set; }
+        public StyleLength borderBottomLeftRadius { get; set; }
+        public StyleLength borderBottomRightRadius { get; set; }
+        public StyleColor backgroundColor { get; set; }
+        public StyleColor borderTopColor { get; set; }
+        public StyleColor borderBottomColor { get; set; }
+        public StyleColor borderLeftColor { get; set; }
+        public StyleColor borderRightColor { get; set; }
+        public StyleColor color { get; set; }
+        public StyleLength fontSize { get; set; }
+        public StyleEnum<WhiteSpace> whiteSpace { get; set; }
+    }
+
+    public class VisualElement
+    {
+        private readonly List<VisualElement> _children = new List<VisualElement>();
+        public string name { get; set; } = string.Empty;
+        public string tooltip { get; set; } = string.Empty;
+        public IStyle style { get; } = new IStyle();
+        public int childCount => _children.Count;
+        public IReadOnlyList<VisualElement> Children => _children;
+        public void Add(VisualElement child) { if (child != null) _children.Add(child); }
+        public void Clear() => _children.Clear();
+    }
+
+    public class Label : VisualElement
+    {
+        public string text { get; set; }
+        public Label() : this(string.Empty) { }
+        public Label(string text) { this.text = text ?? string.Empty; }
+    }
+
+    public class Button : VisualElement
+    {
+        private readonly Action _clickEvent;
+        public string text { get; set; }
+        public Button() : this(null) { }
+        public Button(Action clickEvent) { _clickEvent = clickEvent; }
+        public void InvokeClick() => _clickEvent?.Invoke();
+    }
+
+    public sealed class ChangeEvent<T>
+    {
+        public T previousValue { get; set; }
+        public T newValue { get; set; }
+    }
+
+    public delegate void EventCallback<in TEventType>(TEventType evt);
+
+    public class TextField : VisualElement
+    {
+        private string _value = string.Empty;
+        private EventCallback<ChangeEvent<string>> _callback;
+        public string label { get; set; }
+        public string value
+        {
+            get => _value;
+            set
+            {
+                string prev = _value;
+                _value = value ?? string.Empty;
+                _callback?.Invoke(new ChangeEvent<string> { previousValue = prev, newValue = _value });
+            }
+        }
+        public TextField() : this(string.Empty) { }
+        public TextField(string label) { this.label = label; }
+        public void SetValueWithoutNotify(string newValue) { _value = newValue ?? string.Empty; }
+        public void RegisterValueChangedCallback(EventCallback<ChangeEvent<string>> callback) { _callback += callback; }
+    }
+
+    public class ScrollView : VisualElement { }
+
+    public class ProgressBar : VisualElement
+    {
+        public string title { get; set; }
+        public float lowValue { get; set; } = 0f;
+        public float highValue { get; set; } = 100f;
+        public float value { get; set; }
+    }
+
+    public class HelpBox : VisualElement
+    {
+        public string text { get; set; }
+        public HelpBoxMessageType messageType { get; set; }
+        public HelpBox() { }
+        public HelpBox(string text, HelpBoxMessageType messageType)
+        {
+            this.text = text;
+            this.messageType = messageType;
+        }
     }
 }

@@ -389,5 +389,146 @@ Shader ""Custom/NestedAndDoWhile""
             Assert.AreEqual(2, audit.textureSampleCount);
             Assert.AreEqual(2, audit.textureSampleInLoopCount);
         }
+
+        [Test]
+        public void McpBridge_AutoFixShaderSource_UnifiesCBuffersFixesInLoopTexAndMultiCompile()
+        {
+            const string brokenShader = @"
+Shader ""Custom/BrokenMobileShader""
+{
+    SubShader
+    {
+        Pass
+        {
+            Name ""ForwardLit""
+            HLSLPROGRAM
+            #pragma multi_compile _ _CUSTOM_RIM _CUSTOM_GLOW _CUSTOM_SPARKLE
+            #pragma multi_compile _ _EFFECT_A _EFFECT_B _EFFECT_C _EFFECT_D
+            #pragma multi_compile _ _MODE_1 _MODE_2 _MODE_3 _MODE_4 _MODE_5 _MODE_6
+            CBUFFER_START(UnityPerMaterial)
+                half4 _BaseColor;
+                half _Smoothness;
+            CBUFFER_END
+
+            half4 frag(half2 uv : TEXCOORD0) : SV_Target
+            {
+                half4 acc = 0;
+                for (int i = 0; i < 4; i++)
+                {
+                    acc += SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, uv);
+                }
+                return acc * _BaseColor;
+            }
+            ENDHLSL
+        }
+        Pass
+        {
+            Name ""ShadowCaster""
+            HLSLPROGRAM
+            CBUFFER_START(UnityPerMaterial)
+                half4 _BaseColor;
+            CBUFFER_END
+            half4 frag() : SV_Target { return _BaseColor; }
+            ENDHLSL
+        }
+    }
+}";
+
+            ShaderAutoFixReport fixReport = MobileShaderGuardMcpBridge.AutoFixShaderSource(
+                brokenShader,
+                "Assets/BrokenMobileShader.shader");
+
+            Assert.IsTrue(fixReport.modified);
+            Assert.AreEqual(3, fixReport.appliedFixes.Count);
+            Assert.IsTrue(fixReport.beforeAudit.hasMismatchedSrpBatcherCBuffer);
+            Assert.IsFalse(fixReport.afterAudit.hasMismatchedSrpBatcherCBuffer);
+            Assert.AreEqual(1, fixReport.beforeAudit.textureSampleInLoopCount);
+            Assert.AreEqual(0, fixReport.afterAudit.textureSampleInLoopCount);
+            Assert.AreEqual(0, fixReport.afterAudit.multiCompileDirectiveCount);
+            Assert.AreEqual(3, fixReport.afterAudit.shaderFeatureDirectiveCount);
+            Assert.Greater(fixReport.scoreAfter, fixReport.scoreBefore);
+            Assert.AreEqual(MobileShaderHazardSeverity.Good, fixReport.severityAfter);
+            StringAssert.Contains("SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, uv, 0)", fixReport.patchedSource);
+        }
+
+        [Test]
+        public void McpBridge_HandlesJsonRpcInitializeToolsListToolsCallAndErrors()
+        {
+            // 1. initialize
+            string initRes = MobileShaderGuardMcpBridge.HandleJsonRpcRequest(
+                @"{""jsonrpc"":""2.0"",""id"":1,""method"":""initialize""}");
+            StringAssert.Contains(@"""protocolVersion"":""2024-11-05""", initRes);
+            StringAssert.Contains(@"""name"":""unity-mobile-shader-guard""", initRes);
+            StringAssert.Contains(@"""id"":1", initRes);
+
+            // 2. tools/list
+            string listRes = MobileShaderGuardMcpBridge.HandleJsonRpcRequest(
+                @"{""jsonrpc"":""2.0"",""id"":""req-2"",""method"":""tools/list""}");
+            StringAssert.Contains("shader_guard.audit_shader_source", listRes);
+            StringAssert.Contains("shader_guard.scan_directory", listRes);
+            StringAssert.Contains("shader_guard.autofix_shader_source", listRes);
+
+            // 3. tools/call -> shader_guard.audit_shader_source
+            string callAudit = MobileShaderGuardMcpBridge.HandleJsonRpcRequest(
+                @"{""jsonrpc"":""2.0"",""id"":3,""method"":""tools/call"",""params"":{""name"":""shader_guard.audit_shader_source"",""arguments"":{""source"":""Shader \""Custom/McpTest\"" { SubShader { Pass { HLSLPROGRAM CBUFFER_START(UnityPerMaterial) half4 _Col; CBUFFER_END half4 frag() : SV_Target { clip(-1); return _Col; } ENDHLSL } } }""}}}");
+            StringAssert.Contains(@"""shaderName"":""Custom/McpTest""", callAudit);
+            StringAssert.Contains(@"""alphaTestDiscardCount"":1", callAudit);
+            StringAssert.Contains(@"""isError"":false", callAudit);
+
+            // 4. tools/call -> shader_guard.autofix_shader_source
+            string callFix = MobileShaderGuardMcpBridge.HandleJsonRpcRequest(
+                @"{""jsonrpc"":""2.0"",""id"":4,""method"":""tools/call"",""params"":{""name"":""shader_guard.autofix_shader_source"",""arguments"":{""source"":""Shader \""Custom/FixMe\"" { SubShader { Pass { HLSLPROGRAM CBUFFER_START(UnityPerMaterial) half4 _Col; CBUFFER_END half4 frag(half2 uv : TEXCOORD0) : SV_Target { half4 c = 0; for(int i=0;i<2;i++) { c += SAMPLE_TEXTURE2D(_T, sampler_T, uv); } return c; } ENDHLSL } } }""}}}");
+            StringAssert.Contains(@"""modified"":true", callFix);
+            StringAssert.Contains("SAMPLE_TEXTURE2D_LOD", callFix);
+
+            // 5. Error handling: empty, unknown method, unknown tool
+            string errEmpty = MobileShaderGuardMcpBridge.HandleJsonRpcRequest("");
+            StringAssert.Contains("-32700", errEmpty);
+
+            string errUnknownMethod = MobileShaderGuardMcpBridge.HandleJsonRpcRequest(
+                @"{""jsonrpc"":""2.0"",""id"":99,""method"":""unknown/method""}");
+            StringAssert.Contains("-32601", errUnknownMethod);
+
+            string errUnknownTool = MobileShaderGuardMcpBridge.HandleJsonRpcRequest(
+                @"{""jsonrpc"":""2.0"",""id"":100,""method"":""tools/call"",""params"":{""name"":""nonexistent.tool""}}");
+            StringAssert.Contains("-32602", errUnknownTool);
+        }
+
+        [Test]
+        public void UiToolkitWindow_BuildsHeatmapAndFiltersResultsBySearchAndSeverity()
+        {
+            var rGood = MobileHlslStaticAnalyzer.AnalyzeShaderSource(
+                @"Shader ""Custom/GoodMobile"" { SubShader { Pass { HLSLPROGRAM CBUFFER_START(UnityPerMaterial) half4 _C; CBUFFER_END half4 frag() : SV_Target { return _C; } ENDHLSL } } }",
+                "Assets/GoodMobile.shader");
+
+            var rCritical = MobileHlslStaticAnalyzer.AnalyzeShaderSource(
+                @"Shader ""Custom/CriticalDepth"" { SubShader { Pass { HLSLPROGRAM half4 frag(out float d : SV_Depth) : SV_Target { d = 0.5; return 0; } ENDHLSL } } }",
+                "Assets/CriticalDepth.shader");
+
+            var win = new MobileShaderGuardWindow();
+            win.CreateGUI();
+            Assert.Greater(win.rootVisualElement.childCount, 0);
+
+            win.SetAuditResults(new[] { rGood, rCritical });
+            Assert.AreEqual(2, win.GetFilteredResults().Count);
+
+            ShaderGuardHeatmapSummary heatmap = MobileShaderGuardMcpBridge.ComputeHeatmapSummary(win.Results);
+            Assert.AreEqual(2, heatmap.totalShaders);
+            Assert.AreEqual(1, heatmap.criticalCount);
+            Assert.AreEqual(1, heatmap.goodCount);
+            Assert.AreEqual(0.5f, heatmap.criticalRatio, 0.001f);
+            Assert.AreEqual(0.5f, heatmap.goodRatio, 0.001f);
+
+            // Filter by minimum severity
+            win.SetMinimumSeverityFilter(MobileShaderHazardSeverity.Critical);
+            Assert.AreEqual(1, win.GetFilteredResults().Count);
+            Assert.AreEqual("Custom/CriticalDepth", win.GetFilteredResults()[0].shaderName);
+
+            // Reset severity and filter by search query
+            win.SetMinimumSeverityFilter(MobileShaderHazardSeverity.Good);
+            win.SetSearchFilter("GoodMobile");
+            Assert.AreEqual(1, win.GetFilteredResults().Count);
+            Assert.AreEqual("Custom/GoodMobile", win.GetFilteredResults()[0].shaderName);
+        }
     }
 }
