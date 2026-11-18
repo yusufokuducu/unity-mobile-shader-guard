@@ -530,5 +530,90 @@ Shader ""Custom/BrokenMobileShader""
             Assert.AreEqual(1, win.GetFilteredResults().Count);
             Assert.AreEqual("Custom/GoodMobile", win.GetFilteredResults()[0].shaderName);
         }
+
+        [Test]
+        public void McpBridge_AutoFix_HandlesNestedUvParensCrlfMultiDeclarationsAndJsonKeyOrdering()
+        {
+            // Build shader with explicit CRLF (\r\n) line endings, multi-variable CBUFFER declaration,
+            // commented-out CBUFFER fields, nested UV parentheses in SAMPLE_TEXTURE2D, and do-while tex2D
+            string complexShader =
+                "Shader \"Custom/ComplexAutoFix\"\r\n" +
+                "{\r\n" +
+                "    SubShader\r\n" +
+                "    {\r\n" +
+                "        Pass\r\n" +
+                "        {\r\n" +
+                "            HLSLPROGRAM\r\n" +
+                "            #pragma multi_compile _ _CUSTOM_A _CUSTOM_B _CUSTOM_C\r\n" +
+                "            #pragma multi_compile_local_fragment _ _FEAT_X _FEAT_Y _FEAT_Z\r\n" +
+                "            CBUFFER_START(UnityPerMaterial)\r\n" +
+                "                /*\r\n" +
+                "                half4 _CommentedOutDeadProp;\r\n" +
+                "                */\r\n" +
+                "                half4 _BaseColor, _SpecColor;\r\n" +
+                "            CBUFFER_END\r\n" +
+                "            half4 frag(half2 uv : TEXCOORD0) : SV_Target\r\n" +
+                "            {\r\n" +
+                "                half4 acc = 0;\r\n" +
+                "                for (int i = 0; i < 3; i++)\r\n" +
+                "                    acc += SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, uv + half2(i * 0.01, 0));\r\n" +
+                "                int k = 0;\r\n" +
+                "                do { acc += tex2D(_SecondTex, uv + half2(0, k)); k++; } while (k < 2);\r\n" +
+                "                return acc * _BaseColor * _SpecColor;\r\n" +
+                "            }\r\n" +
+                "            ENDHLSL\r\n" +
+                "        }\r\n" +
+                "        Pass\r\n" +
+                "        {\r\n" +
+                "            HLSLPROGRAM\r\n" +
+                "            CBUFFER_START(UnityPerMaterial)\r\n" +
+                "                half4 _BaseColor;\r\n" +
+                "            CBUFFER_END\r\n" +
+                "            half4 frag() : SV_Target { return _BaseColor; }\r\n" +
+                "            ENDHLSL\r\n" +
+                "        }\r\n" +
+                "    }\r\n" +
+                "}\r\n";
+
+            ShaderAutoFixReport report = MobileShaderGuardMcpBridge.AutoFixShaderSource(complexShader, "Assets/ComplexAutoFix.shader");
+
+            Assert.IsTrue(report.modified);
+            // Both _BaseColor and _SpecColor must be preserved, and _CommentedOutDeadProp must NOT be resurrected
+            StringAssert.Contains("half4 _BaseColor;", report.patchedSource);
+            StringAssert.Contains("half4 _SpecColor;", report.patchedSource);
+            StringAssert.DoesNotContain("_CommentedOutDeadProp", report.AfterCBufferSectionOrSource());
+            Assert.IsFalse(report.afterAudit.hasMismatchedSrpBatcherCBuffer);
+
+            // Nested parentheses in UV must remain intact with ', 0)' appended to SAMPLE_TEXTURE2D_LOD
+            StringAssert.Contains("SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, uv + half2(i * 0.01, 0), 0)", report.patchedSource);
+            StringAssert.Contains("tex2Dlod(_SecondTex, float4(uv + half2(0, k), 0, 0))", report.patchedSource);
+            Assert.AreEqual(0, report.afterAudit.textureSampleInLoopCount);
+
+            // CRLF #pragma multi_compile and #pragma multi_compile_local_fragment must be converted
+            Assert.AreEqual(0, report.afterAudit.multiCompileDirectiveCount);
+            Assert.AreEqual(2, report.afterAudit.shaderFeatureDirectiveCount);
+            StringAssert.Contains("#pragma shader_feature_local _ _CUSTOM_A _CUSTOM_B _CUSTOM_C", report.patchedSource);
+            StringAssert.Contains("#pragma shader_feature_local_fragment _ _FEAT_X _FEAT_Y _FEAT_Z", report.patchedSource);
+
+            // JSON-RPC 2.0 with alphabetical key ordering ("arguments" before "name", "id" at end) and decoy keys inside source
+            string decoyJsonRpc =
+                "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"arguments\":{\"source\":\"Shader \\\"Custom/Decoy\\\" { /* \\\"id\\\": 999, \\\"name\\\": \\\"evil.tool\\\", \\\"method\\\": \\\"hack\\\" */ SubShader { Pass { HLSLPROGRAM CBUFFER_START(UnityPerMaterial) half4 _C; CBUFFER_END half4 frag() : SV_Target { return _C; } ENDHLSL } } }\",\"assetPath\":\"Assets/Decoy.shader\"},\"name\":\"shader_guard.audit_shader_source\"},\"id\":42}";
+            string rpcResponse = MobileShaderGuardMcpBridge.HandleJsonRpcRequest(decoyJsonRpc);
+            StringAssert.Contains("\"id\":42", rpcResponse);
+            StringAssert.Contains("\"shaderName\":\"Custom/Decoy\"", rpcResponse);
+            StringAssert.Contains("\"isError\":false", rpcResponse);
+
+            // Verify parameterless CLI overload exists for Unity -executeMethod
+            Assert.IsNotNull(typeof(MobileShaderGuardCli).GetMethod("RunMcpAuditJson", System.Type.EmptyTypes));
+        }
+    }
+
+    internal static class TestReportExtensions
+    {
+        public static string AfterCBufferSectionOrSource(this ShaderAutoFixReport report)
+        {
+            int idx = report.patchedSource.LastIndexOf("CBUFFER_START", System.StringComparison.Ordinal);
+            return idx >= 0 ? report.patchedSource.Substring(idx) : report.patchedSource;
+        }
     }
 }

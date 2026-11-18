@@ -73,9 +73,14 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
         /// MCP / AI Agent batchmode entrypoint outputting structured JSON diagnostics & heatmap summary:
         /// unity -batchmode -quit -projectPath . -executeMethod YusufOkuducu.MobileShaderGuard.Editor.MobileShaderGuardCli.RunMcpAuditJson
         /// </summary>
-        public static string RunMcpAuditJson(string rootDirectory = "Assets")
+        public static string RunMcpAuditJson()
         {
-            List<ShaderSourceAuditResult> results = ScanDirectoryShaders(rootDirectory);
+            return RunMcpAuditJson("Assets");
+        }
+
+        public static string RunMcpAuditJson(string rootDirectory)
+        {
+            List<ShaderSourceAuditResult> results = ScanDirectoryShaders(string.IsNullOrEmpty(rootDirectory) ? "Assets" : rootDirectory);
             string json = MobileShaderGuardMcpBridge.ExportAuditReportToJson(results);
 
             string logDir = Path.Combine(Directory.GetCurrentDirectory(), "Logs");

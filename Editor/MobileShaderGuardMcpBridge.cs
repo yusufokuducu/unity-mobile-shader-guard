@@ -55,20 +55,24 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
             @"CBUFFER_START\s*\(\s*UnityPerMaterial\s*\)([\s\S]*?)CBUFFER_END",
             RegexOptions.Compiled);
 
-        private static readonly Regex CBufferFieldLineRegex = new Regex(
-            @"^\s*([A-Za-z_]\w*)\s+([A-Za-z_]\w*(?:\s*\[\s*\d+\s*\])?)\s*;",
+        private static readonly Regex CBufferStatementRegex = new Regex(
+            @"^\s*(?:uniform\s+)?([A-Za-z_]\w*)\s+([^;]+);",
             RegexOptions.Compiled | RegexOptions.Multiline);
 
         private static readonly Regex CustomMultiCompileRegex = new Regex(
-            @"^([ \t]*#pragma[ \t]+)multi_compile(_fragment|_vertex)?([ \t]+[^\r\n]+)$",
+            @"^([ \t]*#pragma[ \t]+)multi_compile(_local_fragment|_local_vertex|_local|_fragment|_vertex)?([ \t]+[^\r\n]+?)(?=\r?$)",
             RegexOptions.Compiled | RegexOptions.Multiline);
 
-        private static readonly Regex SampleTex2DCallRegex = new Regex(
-            @"\bSAMPLE_TEXTURE2D\s*\(\s*([^,]+?)\s*,\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+        private static readonly Regex NonLodTexCallHeaderRegex = new Regex(
+            @"\b(SAMPLE_TEXTURE2D|tex2D)\s*\(",
             RegexOptions.Compiled);
 
-        private static readonly Regex ForWhileLoopHeaderRegex = new Regex(
-            @"\b(?:for|while)\s*\(",
+        private static readonly Regex ForOrWhileLoopHeaderRegex = new Regex(
+            @"(?:\[(?:unroll|loop)\s*(?:\(\s*\d+\s*\))?\s*\]\s*)?\b(for|while)\s*\(",
+            RegexOptions.Compiled);
+
+        private static readonly Regex DoLoopHeaderRegex = new Regex(
+            @"(?:\[(?:unroll|loop)\s*(?:\(\s*\d+\s*\))?\s*\]\s*)?\bdo\b",
             RegexOptions.Compiled);
 
         public static ShaderGuardHeatmapSummary ComputeHeatmapSummary(IReadOnlyList<ShaderSourceAuditResult> results)
@@ -155,23 +159,50 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
             // 1. Unify mismatched CBUFFER_START(UnityPerMaterial) blocks across passes
             if (unifyMismatchedSrpBatcherCBuffers && before.hasMismatchedSrpBatcherCBuffer)
             {
-                MatchCollection cbufferMatches = CBufferBlockRegex.Matches(working);
-                if (cbufferMatches.Count > 1)
+                bool[] mask = BuildCommentAndStringMask(working);
+                MatchCollection allCbufferMatches = CBufferBlockRegex.Matches(working);
+                var activeMatches = new List<Match>(allCbufferMatches.Count);
+                for (int m = 0; m < allCbufferMatches.Count; m++)
                 {
-                    var canonicalFields = new List<(string type, string name)>();
+                    if (allCbufferMatches[m].Index < mask.Length && !mask[allCbufferMatches[m].Index])
+                        activeMatches.Add(allCbufferMatches[m]);
+                }
+
+                if (activeMatches.Count > 1)
+                {
+                    var canonicalFields = new List<(string type, string decl)>();
                     var seenFieldNames = new HashSet<string>(StringComparer.Ordinal);
 
-                    for (int m = 0; m < cbufferMatches.Count; m++)
+                    for (int m = 0; m < activeMatches.Count; m++)
                     {
-                        string blockBody = cbufferMatches[m].Groups[1].Value;
-                        MatchCollection fields = CBufferFieldLineRegex.Matches(blockBody);
-                        for (int f = 0; f < fields.Count; f++)
+                        string rawBody = activeMatches[m].Groups[1].Value;
+                        MobileHlslStaticAnalyzer.SanitizeCommentsAndStrings(rawBody, out _, out string uncommentedBody);
+                        string activeBody = MobileHlslStaticAnalyzer.StripDisabledPreprocessorBlocks(uncommentedBody);
+
+                        MatchCollection stmts = CBufferStatementRegex.Matches(activeBody);
+                        for (int s = 0; s < stmts.Count; s++)
                         {
-                            string fType = fields[f].Groups[1].Value.Trim();
-                            string fName = fields[f].Groups[2].Value.Trim();
-                            if (seenFieldNames.Add(fName))
+                            string fType = stmts[s].Groups[1].Value.Trim();
+                            if (string.Equals(fType, "return", StringComparison.Ordinal))
+                                continue;
+
+                            string declaratorList = stmts[s].Groups[2].Value;
+                            string[] declarators = declaratorList.Split(',');
+                            for (int d = 0; d < declarators.Length; d++)
                             {
-                                canonicalFields.Add((fType, fName));
+                                string decl = declarators[d].Trim();
+                                if (string.IsNullOrEmpty(decl))
+                                    continue;
+
+                                int bracketIdx = decl.IndexOf('[');
+                                string baseVarName = (bracketIdx > 0 ? decl.Substring(0, bracketIdx) : decl).Trim();
+                                if (string.IsNullOrEmpty(baseVarName))
+                                    continue;
+
+                                if (seenFieldNames.Add(baseVarName))
+                                {
+                                    canonicalFields.Add((fType, decl));
+                                }
                             }
                         }
                     }
@@ -185,20 +216,26 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
                             unifiedSb.Append("                ")
                                      .Append(canonicalFields[i].type)
                                      .Append(' ')
-                                     .Append(canonicalFields[i].name)
+                                     .Append(canonicalFields[i].decl)
                                      .AppendLine(";");
                         }
                         unifiedSb.Append("            CBUFFER_END");
 
                         string unifiedBlock = unifiedSb.ToString();
-                        working = CBufferBlockRegex.Replace(working, unifiedBlock);
+                        var sbReplace = new StringBuilder(working);
+                        for (int m = activeMatches.Count - 1; m >= 0; m--)
+                        {
+                            sbReplace.Remove(activeMatches[m].Index, activeMatches[m].Length);
+                            sbReplace.Insert(activeMatches[m].Index, unifiedBlock);
+                        }
+                        working = sbReplace.ToString();
                         report.appliedFixes.Add(
-                            $"Unified {cbufferMatches.Count} CBUFFER_START(UnityPerMaterial) blocks across passes with {canonicalFields.Count} canonical properties for SRP Batcher compatibility.");
+                            $"Unified {activeMatches.Count} CBUFFER_START(UnityPerMaterial) blocks across passes with {canonicalFields.Count} canonical properties for SRP Batcher compatibility.");
                     }
                 }
             }
 
-            // 2. Upgrade in-loop SAMPLE_TEXTURE2D(tex, samp, uv) to SAMPLE_TEXTURE2D_LOD(tex, samp, uv, 0)
+            // 2. Upgrade in-loop SAMPLE_TEXTURE2D(tex, samp, uv) and tex2D(samp, uv) calls to explicit LOD
             if (fixInLoopTextureLods && before.textureSampleInLoopCount > 0)
             {
                 int replacedCount = 0;
@@ -206,16 +243,20 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
                 if (replacedCount > 0)
                 {
                     report.appliedFixes.Add(
-                        $"Replaced {replacedCount} in-loop SAMPLE_TEXTURE2D call(s) with explicit-gradient SAMPLE_TEXTURE2D_LOD(..., 0) to prevent mobile GPU gradient stalls.");
+                        $"Replaced {replacedCount} in-loop texture sample call(s) with explicit-gradient LOD sampling to prevent mobile GPU gradient stalls.");
                 }
             }
 
             // 3. Convert custom/artist #pragma multi_compile directives to #pragma shader_feature_local
             if (convertArtistMultiCompileToShaderFeature && before.multiCompileDirectiveCount > 0)
             {
+                bool[] pragmaMask = BuildCommentAndStringMask(working);
                 int convertedPragmas = 0;
                 working = CustomMultiCompileRegex.Replace(working, match =>
                 {
+                    if (match.Index < pragmaMask.Length && pragmaMask[match.Index])
+                        return match.Value;
+
                     string prefix = match.Groups[1].Value;
                     string stageSuffix = match.Groups[2].Success ? match.Groups[2].Value : string.Empty;
                     string tail = match.Groups[3].Value;
@@ -230,9 +271,14 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
                         return match.Value;
 
                     convertedPragmas++;
-                    string localDirective = string.IsNullOrEmpty(stageSuffix)
-                        ? "shader_feature_local"
-                        : "shader_feature_local" + stageSuffix;
+                    string localDirective;
+                    if (string.IsNullOrEmpty(stageSuffix) || string.Equals(stageSuffix, "_local", StringComparison.Ordinal))
+                        localDirective = "shader_feature_local";
+                    else if (stageSuffix.StartsWith("_local_", StringComparison.Ordinal))
+                        localDirective = "shader_feature" + stageSuffix;
+                    else
+                        localDirective = "shader_feature_local" + stageSuffix;
+
                     return prefix + localDirective + tail;
                 });
 
@@ -256,50 +302,105 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
         private static string UpgradeInLoopTextureSamplesToLod(string source, out int replacedCount)
         {
             replacedCount = 0;
-            MatchCollection loops = ForWhileLoopHeaderRegex.Matches(source);
-            if (loops.Count == 0)
+            if (string.IsNullOrEmpty(source))
                 return source;
 
-            var sb = new StringBuilder(source);
-            // Process from end to start so string offsets remain valid
-            for (int i = loops.Count - 1; i >= 0; i--)
+            bool[] mask = BuildCommentAndStringMask(source);
+            var bodySpans = new List<(int start, int end)>();
+            var doWhileTailPositions = new HashSet<int>();
+
+            // 1. Detect do { ... } while (...); loops
+            MatchCollection doMatches = DoLoopHeaderRegex.Matches(source);
+            for (int i = 0; i < doMatches.Count; i++)
             {
-                int idx = loops[i].Index + loops[i].Length;
-                int parenDepth = 1;
-                while (idx < sb.Length && parenDepth > 0)
-                {
-                    char c = sb[idx++];
-                    if (c == '(') parenDepth++;
-                    else if (c == ')') parenDepth--;
-                }
-
-                while (idx < sb.Length && char.IsWhiteSpace(sb[idx]))
-                    idx++;
-
-                if (idx >= sb.Length || sb[idx] != '{')
+                Match dm = doMatches[i];
+                if (dm.Index < mask.Length && mask[dm.Index])
                     continue;
 
-                int bodyStart = idx + 1;
-                int braceDepth = 1;
-                idx++;
-                while (idx < sb.Length && braceDepth > 0)
+                int probe = dm.Index + dm.Length;
+                while (probe < source.Length && (char.IsWhiteSpace(source[probe]) || mask[probe]))
+                    probe++;
+
+                if (probe >= source.Length || source[probe] != '{')
+                    continue;
+
+                if (TryExtractStatementOrBlockSpan(source, mask, probe, out int bStart, out int bEnd, out int afterBlock))
                 {
-                    char c = sb[idx++];
-                    if (c == '{') braceDepth++;
-                    else if (c == '}') braceDepth--;
+                    bodySpans.Add((bStart, bEnd));
+                    while (afterBlock < source.Length && (char.IsWhiteSpace(source[afterBlock]) || mask[afterBlock]))
+                        afterBlock++;
+                    if (afterBlock + 5 <= source.Length &&
+                        string.Compare(source, afterBlock, "while", 0, 5, StringComparison.Ordinal) == 0)
+                    {
+                        doWhileTailPositions.Add(afterBlock);
+                    }
                 }
-                int bodyEnd = Math.Max(bodyStart, idx - 1);
+            }
+
+            // 2. Detect for (...) and while (...) loops (including single-statement braceless loops)
+            MatchCollection loops = ForOrWhileLoopHeaderRegex.Matches(source);
+            for (int i = 0; i < loops.Count; i++)
+            {
+                Match m = loops[i];
+                if (m.Index < mask.Length && mask[m.Index])
+                    continue;
+
+                int keywordIdx = m.Groups[1].Index;
+                if (doWhileTailPositions.Contains(keywordIdx))
+                    continue;
+
+                int idx = m.Index + m.Length;
+                int parenDepth = 1;
+                while (idx < source.Length && parenDepth > 0)
+                {
+                    if (!mask[idx])
+                    {
+                        char c = source[idx];
+                        if (c == '(') parenDepth++;
+                        else if (c == ')') parenDepth--;
+                    }
+                    idx++;
+                }
+
+                while (idx < source.Length && (char.IsWhiteSpace(source[idx]) || mask[idx]))
+                    idx++;
+
+                if (TryExtractStatementOrBlockSpan(source, mask, idx, out int bStart, out int bEnd, out _))
+                {
+                    bodySpans.Add((bStart, bEnd));
+                }
+            }
+
+            if (bodySpans.Count == 0)
+                return source;
+
+            // Merge overlapping or nested loop spans so each in-loop sample is upgraded exactly once
+            bodySpans.Sort((a, b) => a.start != b.start ? a.start.CompareTo(b.start) : a.end.CompareTo(b.end));
+            var merged = new List<(int start, int end)>(bodySpans.Count);
+            var cur = bodySpans[0];
+            for (int i = 1; i < bodySpans.Count; i++)
+            {
+                var next = bodySpans[i];
+                if (next.start <= cur.end)
+                    cur = (cur.start, Math.Max(cur.end, next.end));
+                else
+                {
+                    merged.Add(cur);
+                    cur = next;
+                }
+            }
+            merged.Add(cur);
+
+            var sb = new StringBuilder(source);
+            for (int i = merged.Count - 1; i >= 0; i--)
+            {
+                int bodyStart = merged[i].start;
+                int bodyEnd = merged[i].end;
                 if (bodyEnd <= bodyStart)
                     continue;
 
                 string body = sb.ToString(bodyStart, bodyEnd - bodyStart);
-                int localCount = 0;
-                string patchedBody = SampleTex2DCallRegex.Replace(body, m =>
-                {
-                    localCount++;
-                    return $"SAMPLE_TEXTURE2D_LOD({m.Groups[1].Value.Trim()}, {m.Groups[2].Value.Trim()}, {m.Groups[3].Value.Trim()}, 0)";
-                });
-
+                string patchedBody = UpgradeNonLodTextureCallsInSpan(body, out int localCount);
                 if (localCount > 0)
                 {
                     replacedCount += localCount;
@@ -309,6 +410,181 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
             }
 
             return sb.ToString();
+        }
+
+        private static bool TryExtractStatementOrBlockSpan(
+            string code,
+            bool[] mask,
+            int idx,
+            out int bodyStart,
+            out int bodyEnd,
+            out int afterBlockIdx)
+        {
+            bodyStart = 0;
+            bodyEnd = 0;
+            afterBlockIdx = idx;
+            if (idx >= code.Length)
+                return false;
+
+            if (code[idx] == '{')
+            {
+                bodyStart = idx + 1;
+                int braceDepth = 1;
+                idx++;
+                while (idx < code.Length && braceDepth > 0)
+                {
+                    if (!mask[idx])
+                    {
+                        char c = code[idx];
+                        if (c == '{') braceDepth++;
+                        else if (c == '}') braceDepth--;
+                    }
+                    idx++;
+                }
+                bodyEnd = Math.Max(bodyStart, idx - 1);
+                afterBlockIdx = idx;
+                return bodyEnd > bodyStart;
+            }
+            else
+            {
+                bodyStart = idx;
+                int probe = idx;
+                while (probe < code.Length)
+                {
+                    if (!mask[probe] && code[probe] == ';')
+                        break;
+                    probe++;
+                }
+                bodyEnd = probe < code.Length ? probe : code.Length;
+                afterBlockIdx = probe < code.Length ? probe + 1 : code.Length;
+                return bodyEnd > bodyStart;
+            }
+        }
+
+        private static string UpgradeNonLodTextureCallsInSpan(string span, out int upgradedCount)
+        {
+            upgradedCount = 0;
+            MatchCollection calls = NonLodTexCallHeaderRegex.Matches(span);
+            if (calls.Count == 0)
+                return span;
+
+            bool[] mask = BuildCommentAndStringMask(span);
+            var sb = new StringBuilder(span);
+
+            for (int i = calls.Count - 1; i >= 0; i--)
+            {
+                Match m = calls[i];
+                if (m.Index < mask.Length && mask[m.Index])
+                    continue;
+
+                string funcName = m.Groups[1].Value;
+                int openParenEnd = m.Index + m.Length;
+                int idx = openParenEnd;
+                int parenDepth = 1;
+                var args = new List<string>(4);
+                int argStart = openParenEnd;
+
+                while (idx < span.Length && parenDepth > 0)
+                {
+                    if (!mask[idx])
+                    {
+                        char c = span[idx];
+                        if (c == '(')
+                        {
+                            parenDepth++;
+                        }
+                        else if (c == ')')
+                        {
+                            parenDepth--;
+                            if (parenDepth == 0)
+                            {
+                                args.Add(span.Substring(argStart, idx - argStart).Trim());
+                                idx++;
+                                break;
+                            }
+                        }
+                        else if (c == ',' && parenDepth == 1)
+                        {
+                            args.Add(span.Substring(argStart, idx - argStart).Trim());
+                            argStart = idx + 1;
+                        }
+                    }
+                    idx++;
+                }
+
+                if (parenDepth != 0)
+                    continue;
+
+                int callTotalLength = idx - m.Index;
+                if (string.Equals(funcName, "SAMPLE_TEXTURE2D", StringComparison.Ordinal) && args.Count == 3)
+                {
+                    string replacement = $"SAMPLE_TEXTURE2D_LOD({args[0]}, {args[1]}, {args[2]}, 0)";
+                    sb.Remove(m.Index, callTotalLength);
+                    sb.Insert(m.Index, replacement);
+                    upgradedCount++;
+                }
+                else if (string.Equals(funcName, "tex2D", StringComparison.Ordinal) && args.Count == 2)
+                {
+                    string replacement = $"tex2Dlod({args[0]}, float4({args[1]}, 0, 0))";
+                    sb.Remove(m.Index, callTotalLength);
+                    sb.Insert(m.Index, replacement);
+                    upgradedCount++;
+                }
+            }
+
+            return sb.ToString();
+        }
+
+        internal static bool[] BuildCommentAndStringMask(string source)
+        {
+            int len = source != null ? source.Length : 0;
+            var mask = new bool[len];
+            int i = 0;
+            while (i < len)
+            {
+                char c = source[i];
+                if (c == '/' && i + 1 < len && source[i + 1] == '*')
+                {
+                    mask[i++] = true;
+                    mask[i++] = true;
+                    while (i < len)
+                    {
+                        if (source[i] == '*' && i + 1 < len && source[i + 1] == '/')
+                        {
+                            mask[i++] = true;
+                            mask[i++] = true;
+                            break;
+                        }
+                        mask[i++] = true;
+                    }
+                    continue;
+                }
+
+                if (c == '/' && i + 1 < len && source[i + 1] == '/')
+                {
+                    while (i < len && source[i] != '\n' && source[i] != '\r')
+                        mask[i++] = true;
+                    continue;
+                }
+
+                if (c == '"')
+                {
+                    mask[i++] = true;
+                    while (i < len)
+                    {
+                        char sc = source[i];
+                        mask[i++] = true;
+                        if (sc == '\\' && i < len)
+                            mask[i++] = true;
+                        else if (sc == '"' || sc == '\n' || sc == '\r')
+                            break;
+                    }
+                    continue;
+                }
+
+                i++;
+            }
+            return mask;
         }
 
         /// <summary>
@@ -380,16 +656,19 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
 
             if (string.Equals(method, "tools/call", StringComparison.Ordinal))
             {
-                string toolName = ExtractJsonStringField(trimmed, "name");
+                string paramsObj = ExtractJsonObjectField(trimmed, "params") ?? trimmed;
+                string toolName = ExtractJsonStringField(paramsObj, "name");
                 if (string.IsNullOrEmpty(toolName))
                 {
                     return BuildJsonRpcError(idRaw, -32602, "Invalid params: Missing tool 'name' in tools/call.");
                 }
 
+                string argsObj = ExtractJsonObjectField(paramsObj, "arguments") ?? paramsObj;
+
                 if (string.Equals(toolName, "shader_guard.audit_shader_source", StringComparison.Ordinal))
                 {
-                    string source = ExtractJsonStringField(trimmed, "source");
-                    string assetPath = ExtractJsonStringField(trimmed, "assetPath");
+                    string source = ExtractJsonStringField(argsObj, "source");
+                    string assetPath = ExtractJsonStringField(argsObj, "assetPath");
                     if (string.IsNullOrEmpty(assetPath)) assetPath = "<McpInlineShader.shader>";
 
                     ShaderSourceAuditResult audit = MobileHlslStaticAnalyzer.AnalyzeShaderSource(source ?? string.Empty, assetPath);
@@ -400,7 +679,7 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
 
                 if (string.Equals(toolName, "shader_guard.scan_directory", StringComparison.Ordinal))
                 {
-                    string dir = ExtractJsonStringField(trimmed, "rootDirectory");
+                    string dir = ExtractJsonStringField(argsObj, "rootDirectory");
                     if (string.IsNullOrEmpty(dir)) dir = "Assets";
                     List<ShaderSourceAuditResult> results = MobileShaderGuardCli.ScanDirectoryShaders(dir);
                     string payload = ExportAuditReportToJson(results);
@@ -409,11 +688,19 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
 
                 if (string.Equals(toolName, "shader_guard.autofix_shader_source", StringComparison.Ordinal))
                 {
-                    string source = ExtractJsonStringField(trimmed, "source");
-                    string assetPath = ExtractJsonStringField(trimmed, "assetPath");
+                    string source = ExtractJsonStringField(argsObj, "source");
+                    string assetPath = ExtractJsonStringField(argsObj, "assetPath");
                     if (string.IsNullOrEmpty(assetPath)) assetPath = "<McpInlineShader.shader>";
+                    bool unifyCBuffer = ExtractJsonBoolField(argsObj, "unifyMismatchedSrpBatcherCBuffers", true);
+                    bool fixLoopLod = ExtractJsonBoolField(argsObj, "fixInLoopTextureLods", true);
+                    bool fixMultiCompile = ExtractJsonBoolField(argsObj, "convertArtistMultiCompileToShaderFeature", true);
 
-                    ShaderAutoFixReport fixReport = AutoFixShaderSource(source ?? string.Empty, assetPath);
+                    ShaderAutoFixReport fixReport = AutoFixShaderSource(
+                        source ?? string.Empty,
+                        assetPath,
+                        unifyCBuffer,
+                        fixLoopLod,
+                        fixMultiCompile);
                     string payload = SerializeAutoFixReportJson(fixReport);
                     return BuildJsonRpcToolCallResult(idRaw, payload);
                 }
@@ -587,16 +874,148 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
 
         internal static string ExtractJsonRpcIdRaw(string json)
         {
-            var m = Regex.Match(json, @"""id""\s*:\s*(""[^""\\]*(?:\\.[^""\\]*)*""|-?\d+|null)");
-            return m.Success ? m.Groups[1].Value : "null";
+            if (TryGetDirectJsonPropertyValue(json, "id", out string rawVal) && !string.IsNullOrEmpty(rawVal))
+            {
+                return rawVal;
+            }
+            return "null";
+        }
+
+        internal static string ExtractJsonObjectField(string json, string fieldName)
+        {
+            if (TryGetDirectJsonPropertyValue(json, fieldName, out string rawVal) &&
+                !string.IsNullOrEmpty(rawVal) &&
+                rawVal[0] == '{')
+            {
+                return rawVal;
+            }
+            return null;
         }
 
         internal static string ExtractJsonStringField(string json, string fieldName)
         {
-            string pattern = $@"""{Regex.Escape(fieldName)}""\s*:\s*""((?:[^""\\]|\\.)*)""";
-            Match m = Regex.Match(json, pattern);
-            if (!m.Success) return null;
-            return UnescapeJsonString(m.Groups[1].Value);
+            if (TryGetDirectJsonPropertyValue(json, fieldName, out string rawVal) &&
+                !string.IsNullOrEmpty(rawVal) &&
+                rawVal.Length >= 2 &&
+                rawVal[0] == '"' &&
+                rawVal[rawVal.Length - 1] == '"')
+            {
+                return UnescapeJsonString(rawVal.Substring(1, rawVal.Length - 2));
+            }
+            return null;
+        }
+
+        internal static bool ExtractJsonBoolField(string json, string fieldName, bool defaultValue)
+        {
+            if (TryGetDirectJsonPropertyValue(json, fieldName, out string rawVal))
+            {
+                if (string.Equals(rawVal, "true", StringComparison.Ordinal)) return true;
+                if (string.Equals(rawVal, "false", StringComparison.Ordinal)) return false;
+            }
+            return defaultValue;
+        }
+
+        internal static bool TryGetDirectJsonPropertyValue(string jsonObject, string propertyName, out string rawValue)
+        {
+            rawValue = null;
+            if (string.IsNullOrWhiteSpace(jsonObject) || string.IsNullOrEmpty(propertyName))
+                return false;
+
+            string s = jsonObject.Trim();
+            if (s.Length < 2 || s[0] != '{')
+                return false;
+
+            int i = 1;
+            int len = s.Length;
+            while (i < len)
+            {
+                while (i < len && (char.IsWhiteSpace(s[i]) || s[i] == ','))
+                    i++;
+                if (i >= len || s[i] == '}')
+                    break;
+
+                if (s[i] != '"')
+                    break;
+
+                int keyStart = i + 1;
+                i = SkipJsonStringLiteral(s, i);
+                int keyEnd = Math.Max(keyStart, i - 1);
+                string key = UnescapeJsonString(s.Substring(keyStart, keyEnd - keyStart));
+
+                while (i < len && char.IsWhiteSpace(s[i]))
+                    i++;
+                if (i >= len || s[i] != ':')
+                    break;
+                i++; // skip ':'
+
+                while (i < len && char.IsWhiteSpace(s[i]))
+                    i++;
+                if (i >= len)
+                    break;
+
+                int valStart = i;
+                i = SkipJsonValue(s, i);
+                int valEnd = i;
+
+                if (string.Equals(key, propertyName, StringComparison.Ordinal))
+                {
+                    rawValue = s.Substring(valStart, valEnd - valStart).Trim();
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static int SkipJsonStringLiteral(string s, int quoteStartIdx)
+        {
+            int i = quoteStartIdx + 1;
+            while (i < s.Length)
+            {
+                char c = s[i++];
+                if (c == '\\' && i < s.Length)
+                    i++;
+                else if (c == '"')
+                    break;
+            }
+            return i;
+        }
+
+        private static int SkipJsonValue(string s, int valStartIdx)
+        {
+            int i = valStartIdx;
+            if (i >= s.Length)
+                return i;
+
+            char c = s[i];
+            if (c == '"')
+                return SkipJsonStringLiteral(s, i);
+
+            if (c == '{' || c == '[')
+            {
+                int depth = 0;
+                while (i < s.Length)
+                {
+                    char ch = s[i];
+                    if (ch == '"')
+                    {
+                        i = SkipJsonStringLiteral(s, i);
+                        continue;
+                    }
+                    if (ch == '{' || ch == '[') depth++;
+                    else if (ch == '}' || ch == ']')
+                    {
+                        depth--;
+                        if (depth == 0)
+                            return i + 1;
+                    }
+                    i++;
+                }
+                return i;
+            }
+
+            while (i < s.Length && s[i] != ',' && s[i] != '}' && s[i] != ']' && !char.IsWhiteSpace(s[i]))
+                i++;
+            return i;
         }
 
         private static string UnescapeJsonString(string escaped)
