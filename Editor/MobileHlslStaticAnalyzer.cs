@@ -50,9 +50,6 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
     public static class MobileHlslStaticAnalyzer
     {
         private static readonly Regex ShaderNameRegex = new Regex(@"Shader\s+""([^""]+)""", RegexOptions.Compiled);
-        private static readonly Regex BlockCommentRegex = new Regex(@"/\*[\s\S]*?\*/", RegexOptions.Compiled);
-        private static readonly Regex SingleLineCommentRegex = new Regex(@"//.*?$", RegexOptions.Compiled | RegexOptions.Multiline);
-        private static readonly Regex StringLiteralRegex = new Regex(@"""(?:\\.|[^""\\])*""", RegexOptions.Compiled);
         private static readonly Regex HlslBlockRegex = new Regex(
             @"\b(?:HLSLPROGRAM|HLSLINCLUDE|CGPROGRAM|CGINCLUDE)\b([\s\S]*?)\b(?:ENDHLSL|ENDCG)\b",
             RegexOptions.Compiled);
@@ -82,10 +79,14 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
         private static readonly Regex CBufferPerMaterialBlockRegex = new Regex(
             @"CBUFFER_START\s*\(\s*UnityPerMaterial\s*\)([\s\S]*?)CBUFFER_END",
             RegexOptions.Compiled);
-        private static readonly Regex LoopHeaderRegex = new Regex(
-            @"(?:\[(?:unroll|loop)\s*(?:\(\s*\d+\s*\))?\s*\]\s*)?\b(?:for|while)\s*\(",
+        private static readonly Regex ForOrWhileHeaderRegex = new Regex(
+            @"(?:\[(?:unroll|loop)\s*(?:\(\s*\d+\s*\))?\s*\]\s*)?\b(for|while)\s*\(",
+            RegexOptions.Compiled);
+        private static readonly Regex DoLoopHeaderRegex = new Regex(
+            @"(?:\[(?:unroll|loop)\s*(?:\(\s*\d+\s*\))?\s*\]\s*)?\bdo\b",
             RegexOptions.Compiled);
         private static readonly Regex WhitespaceNormalizeRegex = new Regex(@"\s+", RegexOptions.Compiled);
+        private static readonly Regex PunctuationSpaceNormalizeRegex = new Regex(@"\s*([;,\[\]])\s*", RegexOptions.Compiled);
 
         public static ShaderSourceAuditResult AnalyzeShaderFile(string filePath)
         {
@@ -112,19 +113,18 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
                 return result;
             }
 
-            // 1. Strip comments first so commented-out Shader "..." or code is ignored
-            string uncommented = BlockCommentRegex.Replace(rawSource, " ");
-            uncommented = SingleLineCommentRegex.Replace(uncommented, string.Empty);
+            // 1. Single-pass lexical scan to strip block/line comments while respecting string literals (e.g. "http://...")
+            SanitizeCommentsAndStrings(rawSource, out string uncommentedWithStrings, out string cleanFullSource);
 
-            Match nameMatch = ShaderNameRegex.Match(uncommented);
+            Match nameMatch = ShaderNameRegex.Match(uncommentedWithStrings);
             if (nameMatch.Success)
                 result.shaderName = nameMatch.Groups[1].Value.Trim();
 
-            // 2. Replace string literals with empty quotes so property display strings ("float clip(x)") do not pollute HLSL counts
-            string cleanFullSource = StringLiteralRegex.Replace(uncommented, "\"\"");
+            // 2. Strip disabled preprocessor blocks (#if 0 ... #endif) before HLSL extraction
+            string activeSource = StripDisabledPreprocessorBlocks(cleanFullSource);
 
             // 3. Extract HLSL/CG program blocks if present (.shader files contain ShaderLab Properties outside HLSLPROGRAM)
-            string hlslCode = ExtractHlslCodeRegions(cleanFullSource);
+            string hlslCode = ExtractHlslCodeRegions(activeSource);
 
             result.fp32DeclarationsCount = Fp32Regex.Matches(hlslCode).Count;
             result.fp16DeclarationsCount = Fp16Regex.Matches(hlslCode).Count;
@@ -162,6 +162,202 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
             {
                 return "<Memory>";
             }
+        }
+
+        /// <summary>
+        /// Single-pass lexical scanner that strips block (/* ... */) and line (// ...) comments
+        /// while respecting string literals ("...") so strings containing "//" or "/*" (e.g. URLs)
+        /// never corrupt comment removal or swallow subsequent HLSL code.
+        /// </summary>
+        public static void SanitizeCommentsAndStrings(
+            string rawSource,
+            out string uncommentedWithStrings,
+            out string uncommentedNoStrings)
+        {
+            if (string.IsNullOrEmpty(rawSource))
+            {
+                uncommentedWithStrings = string.Empty;
+                uncommentedNoStrings = string.Empty;
+                return;
+            }
+
+            int len = rawSource.Length;
+            var sbWithStrings = new StringBuilder(len);
+            var sbNoStrings = new StringBuilder(len);
+            int i = 0;
+
+            while (i < len)
+            {
+                char c = rawSource[i];
+
+                // Block comment: /* ... */
+                if (c == '/' && i + 1 < len && rawSource[i + 1] == '*')
+                {
+                    sbWithStrings.Append(' ');
+                    sbNoStrings.Append(' ');
+                    i += 2;
+                    while (i < len)
+                    {
+                        if (rawSource[i] == '*' && i + 1 < len && rawSource[i + 1] == '/')
+                        {
+                            i += 2;
+                            break;
+                        }
+                        if (rawSource[i] == '\n')
+                        {
+                            sbWithStrings.Append('\n');
+                            sbNoStrings.Append('\n');
+                        }
+                        i++;
+                    }
+                    continue;
+                }
+
+                // Single-line comment: // ...
+                if (c == '/' && i + 1 < len && rawSource[i + 1] == '/')
+                {
+                    i += 2;
+                    while (i < len && rawSource[i] != '\n' && rawSource[i] != '\r')
+                    {
+                        i++;
+                    }
+                    continue;
+                }
+
+                // String literal: "..."
+                if (c == '"')
+                {
+                    sbWithStrings.Append('"');
+                    sbNoStrings.Append("\"\"");
+                    i++;
+                    while (i < len)
+                    {
+                        char sc = rawSource[i++];
+                        sbWithStrings.Append(sc);
+                        if (sc == '\\' && i < len)
+                        {
+                            sbWithStrings.Append(rawSource[i++]);
+                        }
+                        else if (sc == '"' || sc == '\n' || sc == '\r')
+                        {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
+                sbWithStrings.Append(c);
+                sbNoStrings.Append(c);
+                i++;
+            }
+
+            uncommentedWithStrings = sbWithStrings.ToString();
+            uncommentedNoStrings = sbNoStrings.ToString();
+        }
+
+        /// <summary>
+        /// Strips preprocessor blocks disabled via #if 0 / #if false while preserving #else / active #elif branches.
+        /// </summary>
+        public static string StripDisabledPreprocessorBlocks(string source)
+        {
+            if (string.IsNullOrEmpty(source))
+                return string.Empty;
+
+            var sb = new StringBuilder(source.Length);
+            // Stack tracks: (isParentActive, isCurrentBranchActive, hasSeenActiveBranch)
+            var stack = new Stack<(bool parentActive, bool branchActive, bool seenActive)>();
+            bool currentlyActive = true;
+
+            using (var reader = new StringReader(source))
+            {
+                string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    string trimmed = line.TrimStart();
+                    if (trimmed.StartsWith("#", StringComparison.Ordinal))
+                    {
+                        string directiveLine = trimmed.Substring(1).TrimStart();
+                        if (directiveLine.StartsWith("ifdef", StringComparison.Ordinal) ||
+                            directiveLine.StartsWith("ifndef", StringComparison.Ordinal))
+                        {
+                            stack.Push((currentlyActive, currentlyActive, currentlyActive));
+                            sb.AppendLine();
+                            continue;
+                        }
+                        if (directiveLine.StartsWith("if", StringComparison.Ordinal) &&
+                            (directiveLine.Length == 2 || char.IsWhiteSpace(directiveLine[2]) || directiveLine[2] == '('))
+                        {
+                            string expr = directiveLine.Substring(2).Trim();
+                            bool cond = !IsAlwaysFalsePreprocessorCondition(expr);
+                            bool branchActive = currentlyActive && cond;
+                            stack.Push((currentlyActive, branchActive, branchActive));
+                            currentlyActive = branchActive;
+                            sb.AppendLine();
+                            continue;
+                        }
+                        if (directiveLine.StartsWith("elif", StringComparison.Ordinal) &&
+                            (directiveLine.Length == 4 || char.IsWhiteSpace(directiveLine[4]) || directiveLine[4] == '('))
+                        {
+                            if (stack.Count > 0)
+                            {
+                                var top = stack.Pop();
+                                string expr = directiveLine.Substring(4).Trim();
+                                bool cond = !IsAlwaysFalsePreprocessorCondition(expr);
+                                bool branchActive = top.parentActive && !top.seenActive && cond;
+                                stack.Push((top.parentActive, branchActive, top.seenActive || branchActive));
+                                currentlyActive = branchActive;
+                            }
+                            sb.AppendLine();
+                            continue;
+                        }
+                        if (directiveLine.StartsWith("else", StringComparison.Ordinal) &&
+                            (directiveLine.Length == 4 || char.IsWhiteSpace(directiveLine[4])))
+                        {
+                            if (stack.Count > 0)
+                            {
+                                var top = stack.Pop();
+                                bool branchActive = top.parentActive && !top.seenActive;
+                                stack.Push((top.parentActive, branchActive, true));
+                                currentlyActive = branchActive;
+                            }
+                            sb.AppendLine();
+                            continue;
+                        }
+                        if (directiveLine.StartsWith("endif", StringComparison.Ordinal) &&
+                            (directiveLine.Length == 5 || char.IsWhiteSpace(directiveLine[5])))
+                        {
+                            if (stack.Count > 0)
+                            {
+                                var top = stack.Pop();
+                                currentlyActive = top.parentActive;
+                            }
+                            sb.AppendLine();
+                            continue;
+                        }
+                    }
+
+                    if (currentlyActive)
+                        sb.AppendLine(line);
+                    else
+                        sb.AppendLine();
+                }
+            }
+
+            return sb.ToString();
+        }
+
+        private static bool IsAlwaysFalsePreprocessorCondition(string expr)
+        {
+            if (string.IsNullOrEmpty(expr))
+                return false;
+
+            while (expr.Length >= 2 && expr[0] == '(' && expr[expr.Length - 1] == ')')
+            {
+                expr = expr.Substring(1, expr.Length - 2).Trim();
+            }
+
+            return string.Equals(expr, "0", StringComparison.Ordinal) ||
+                   string.Equals(expr, "false", StringComparison.OrdinalIgnoreCase);
         }
 
         private static string ExtractHlslCodeRegions(string cleanFullSource)
@@ -242,27 +438,99 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
             dynamicLoopCount = 0;
             texInLoopCount = 0;
 
-            MatchCollection loops = LoopHeaderRegex.Matches(hlslCode);
+            var bodySpans = new List<(int start, int end)>();
+            var doWhileTailPositions = new HashSet<int>();
+
+            // 1. Detect do { ... } while (...); loops
+            MatchCollection doMatches = DoLoopHeaderRegex.Matches(hlslCode);
+            for (int i = 0; i < doMatches.Count; i++)
+            {
+                Match dm = doMatches[i];
+                int afterDo = dm.Index + dm.Length;
+                // Ensure 'do' is followed by '{' or whitespace then '{'
+                int probe = afterDo;
+                while (probe < hlslCode.Length && char.IsWhiteSpace(hlslCode[probe]))
+                    probe++;
+
+                if (probe >= hlslCode.Length || hlslCode[probe] != '{')
+                    continue;
+
+                bool hasUnroll = dm.Value.IndexOf("unroll", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (!hasUnroll)
+                    dynamicLoopCount++;
+
+                if (TryExtractStatementOrBlockSpan(hlslCode, probe, out int bStart, out int bEnd, out int afterBlock))
+                {
+                    bodySpans.Add((bStart, bEnd));
+                    while (afterBlock < hlslCode.Length && char.IsWhiteSpace(hlslCode[afterBlock]))
+                        afterBlock++;
+                    if (afterBlock + 5 <= hlslCode.Length &&
+                        string.Compare(hlslCode, afterBlock, "while", 0, 5, StringComparison.Ordinal) == 0)
+                    {
+                        doWhileTailPositions.Add(afterBlock);
+                    }
+                }
+            }
+
+            // 2. Detect for (...) and while (...) loops
+            MatchCollection loops = ForOrWhileHeaderRegex.Matches(hlslCode);
             for (int i = 0; i < loops.Count; i++)
             {
                 Match m = loops[i];
+                int keywordIdx = m.Groups[1].Index;
+                if (doWhileTailPositions.Contains(keywordIdx))
+                    continue;
+
                 bool hasUnrollAttribute = m.Value.IndexOf("unroll", StringComparison.OrdinalIgnoreCase) >= 0;
                 if (!hasUnrollAttribute)
                 {
                     dynamicLoopCount++;
                 }
 
-                string loopBody = ExtractBalancedBraceOrStatementBody(hlslCode, m.Index + m.Length);
-                if (!string.IsNullOrEmpty(loopBody))
+                if (TryExtractLoopBodySpanAfterHeaderParen(hlslCode, m.Index + m.Length, out int bodyStart, out int bodyEnd))
                 {
-                    texInLoopCount += NonLodTexSampleRegex.Matches(loopBody).Count;
+                    bodySpans.Add((bodyStart, bodyEnd));
+                }
+            }
+
+            if (bodySpans.Count == 0)
+                return;
+
+            // Merge overlapping/nested loop spans so nested loops never double-count texture samples
+            bodySpans.Sort((a, b) => a.start != b.start ? a.start.CompareTo(b.start) : a.end.CompareTo(b.end));
+            var merged = new List<(int start, int end)>(bodySpans.Count);
+            var cur = bodySpans[0];
+            for (int i = 1; i < bodySpans.Count; i++)
+            {
+                var next = bodySpans[i];
+                if (next.start <= cur.end)
+                {
+                    cur = (cur.start, Math.Max(cur.end, next.end));
+                }
+                else
+                {
+                    merged.Add(cur);
+                    cur = next;
+                }
+            }
+            merged.Add(cur);
+
+            for (int i = 0; i < merged.Count; i++)
+            {
+                int len = merged[i].end - merged[i].start;
+                if (len > 0)
+                {
+                    string spanCode = hlslCode.Substring(merged[i].start, len);
+                    texInLoopCount += NonLodTexSampleRegex.Matches(spanCode).Count;
                 }
             }
         }
 
-        private static string ExtractBalancedBraceOrStatementBody(string code, int startAfterForKeywordParen)
+        private static bool TryExtractLoopBodySpanAfterHeaderParen(string code, int startAfterOpenParen, out int bodyStart, out int bodyEnd)
         {
-            int idx = startAfterForKeywordParen;
+            bodyStart = 0;
+            bodyEnd = 0;
+            int idx = startAfterOpenParen;
             int parenDepth = 1;
             while (idx < code.Length && parenDepth > 0)
             {
@@ -274,12 +542,21 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
             while (idx < code.Length && char.IsWhiteSpace(code[idx]))
                 idx++;
 
+            return TryExtractStatementOrBlockSpan(code, idx, out bodyStart, out bodyEnd, out _);
+        }
+
+        private static bool TryExtractStatementOrBlockSpan(string code, int idx, out int bodyStart, out int bodyEnd, out int afterBlockIdx)
+        {
+            bodyStart = 0;
+            bodyEnd = 0;
+            afterBlockIdx = idx;
+
             if (idx >= code.Length)
-                return string.Empty;
+                return false;
 
             if (code[idx] == '{')
             {
-                int braceStart = idx + 1;
+                bodyStart = idx + 1;
                 int braceDepth = 1;
                 idx++;
                 while (idx < code.Length && braceDepth > 0)
@@ -288,16 +565,25 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
                     if (c == '{') braceDepth++;
                     else if (c == '}') braceDepth--;
                 }
-                int len = Math.Max(0, idx - braceStart - 1);
-                return code.Substring(braceStart, len);
+                bodyEnd = Math.Max(bodyStart, idx - 1);
+                afterBlockIdx = idx;
+                return bodyEnd > bodyStart;
             }
             else
             {
-                int stmtStart = idx;
-                int semiIdx = code.IndexOf(';', stmtStart);
+                bodyStart = idx;
+                int semiIdx = code.IndexOf(';', bodyStart);
                 if (semiIdx < 0)
-                    return code.Substring(stmtStart);
-                return code.Substring(stmtStart, semiIdx - stmtStart);
+                {
+                    bodyEnd = code.Length;
+                    afterBlockIdx = code.Length;
+                }
+                else
+                {
+                    bodyEnd = semiIdx;
+                    afterBlockIdx = semiIdx + 1;
+                }
+                return bodyEnd > bodyStart;
             }
         }
 
@@ -331,7 +617,8 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
         {
             if (string.IsNullOrWhiteSpace(content))
                 return string.Empty;
-            return WhitespaceNormalizeRegex.Replace(content.Trim(), " ");
+            string collapsed = WhitespaceNormalizeRegex.Replace(content.Trim(), " ");
+            return PunctuationSpaceNormalizeRegex.Replace(collapsed, "$1").Trim();
         }
 
         private static void EvaluateDiagnostics(ShaderSourceAuditResult r)

@@ -284,5 +284,110 @@ Shader ""Custom/CommentSafe""
             StringAssert.Contains("Custom/Test", md);
             StringAssert.Contains("Mobile Shader Guard", md);
         }
+
+        [Test]
+        public void StaticAnalyzer_HandlesUrlSlashesInsideStringsAndPreprocessorIfZeroBlocks()
+        {
+            const string shaderWithUrlAndIfZero = @"
+Shader ""Custom/UrlAndIfZeroShader""
+{
+    Properties
+    {
+        _DocUrl (""https://docs.unity3d.com/Manual/* Precision */"", Float) = 1.0
+    }
+    SubShader
+    {
+        Pass
+        {
+            HLSLPROGRAM
+            CBUFFER_START(UnityPerMaterial)
+                half4 _BaseColor;
+                half _Smoothness;
+            CBUFFER_END
+
+            #if 0
+                float4 _Dead1, _Dead2, _Dead3, _Dead4, _Dead5, _Dead6, _Dead7, _Dead8, _Dead9, _Dead10;
+                void DeadFunc(out float d : SV_Depth) { clip(-1); d = 0.5; }
+            #else
+                half4 frag(half2 uv : TEXCOORD0) : SV_Target
+                {
+                    return _BaseColor * _Smoothness;
+                }
+            #endif
+            ENDHLSL
+        }
+        Pass
+        {
+            HLSLPROGRAM
+            CBUFFER_START(UnityPerMaterial)
+                half4   _BaseColor ;
+                half    _Smoothness ;
+            CBUFFER_END
+            half4 frag() : SV_Target { return _BaseColor; }
+            ENDHLSL
+        }
+    }
+    Fallback ""Hidden/Universal Render Pipeline/FallbackError""
+}";
+
+            ShaderSourceAuditResult audit = MobileHlslStaticAnalyzer.AnalyzeShaderSource(shaderWithUrlAndIfZero, "Assets/UrlAndIfZeroShader.shader");
+
+            Assert.AreEqual("Custom/UrlAndIfZeroShader", audit.shaderName);
+            Assert.AreEqual(0, audit.fp32DeclarationsCount);
+            Assert.GreaterOrEqual(audit.fp16DeclarationsCount, 4);
+            Assert.AreEqual(0, audit.alphaTestDiscardCount);
+            Assert.IsFalse(audit.hasSvDepthOutput);
+            Assert.IsTrue(audit.hasSrpBatcherCBuffer);
+            Assert.IsFalse(audit.hasMismatchedSrpBatcherCBuffer);
+            Assert.AreEqual(MobileShaderHazardSeverity.Good, audit.severity);
+        }
+
+        [Test]
+        public void StaticAnalyzer_DetectsDoWhileLoopsAndDoesNotDoubleCountNestedLoops()
+        {
+            const string nestedAndDoWhileShader = @"
+Shader ""Custom/NestedAndDoWhile""
+{
+    SubShader
+    {
+        Pass
+        {
+            HLSLPROGRAM
+            CBUFFER_START(UnityPerMaterial)
+                half4 _Tint;
+            CBUFFER_END
+            half4 frag(half2 uv : TEXCOORD0) : SV_Target
+            {
+                half4 acc = 0;
+                for (int x = 0; x < 2; x++)
+                {
+                    for (int y = 0; y < 2; y++)
+                    {
+                        acc += SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, uv);
+                    }
+                }
+
+                int k = 0;
+                do
+                {
+                    acc += tex2D(_SecondTex, uv);
+                    k++;
+                } while (k < 2);
+
+                return acc * _Tint;
+            }
+            ENDHLSL
+        }
+    }
+}";
+
+            ShaderSourceAuditResult audit = MobileHlslStaticAnalyzer.AnalyzeShaderSource(nestedAndDoWhileShader, "Assets/NestedAndDoWhile.shader");
+
+            // 2 nested for loops + 1 do-while loop = 3 dynamic loops
+            Assert.AreEqual(3, audit.dynamicLoopCount);
+            // Total 2 texture sample calls in source (1 in nested for, 1 in do-while)
+            Assert.AreEqual(2, audit.textureSampleCount);
+            Assert.AreEqual(2, audit.textureSampleInLoopCount);
+        }
     }
 }
