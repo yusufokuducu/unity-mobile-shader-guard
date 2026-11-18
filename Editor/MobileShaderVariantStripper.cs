@@ -32,7 +32,7 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
 
     /// <summary>
     /// Hooks into Unity's shader build pipeline (IPreprocessShaders) to strip forbidden mobile shader
-    /// keyword permutations and outputs an audit report to Logs/MobileShaderGuardStripReport.json.
+    /// keyword permutations and pass types, outputting an audit report to Logs/MobileShaderGuardStripReport.json.
     /// </summary>
     public sealed class MobileShaderVariantStripper : IPreprocessShaders, IPostprocessBuildWithReport
     {
@@ -54,16 +54,26 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
                 return;
 
             string shaderName = shader.name;
-            if (IsWhitelisted(shaderName, profile.whitelistedShaderSubstrings))
+            if (profile.IsShaderWhitelisted(shaderName))
                 return;
 
-            HashSet<string> forbidden = profile.BuildEffectiveForbiddenKeywordSet();
+            string passName = snippet.passName;
             int beforeCount = data.Count;
+
+            if (profile.IsPassForbidden(passName))
+            {
+                data.Clear();
+                RecordStats(shaderName, beforeCount, 0);
+                return;
+            }
+
+            HashSet<string> forbidden = profile.BuildEffectiveForbiddenKeywordSet();
+            var activeKeywordBuffer = new List<string>(16);
 
             for (int i = data.Count - 1; i >= 0; i--)
             {
-                ShaderKeywordSet keywordSet = data[i].shaderKeywordSet;
-                if (ContainsAnyForbiddenKeyword(shader, keywordSet, forbidden))
+                ExtractActiveKeywordNames(shader, data[i].shaderKeywordSet, activeKeywordBuffer);
+                if (profile.ShouldStripVariant(shaderName, passName, activeKeywordBuffer, forbidden, out _))
                 {
                     data.RemoveAt(i);
                 }
@@ -109,11 +119,12 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
             SessionEntries.Clear();
         }
 
-        private static bool ContainsAnyForbiddenKeyword(
+        private static void ExtractActiveKeywordNames(
             Shader shader,
             ShaderKeywordSet keywordSet,
-            HashSet<string> forbidden)
+            List<string> outNames)
         {
+            outNames.Clear();
             ShaderKeyword[] activeKeywords = keywordSet.GetShaderKeywords();
             for (int i = 0; i < activeKeywords.Length; i++)
             {
@@ -121,25 +132,12 @@ namespace YusufOkuducu.MobileShaderGuard.Editor
                 if (string.IsNullOrEmpty(kwName))
                     kwName = activeKeywords[i].name;
 
-                if (!string.IsNullOrEmpty(kwName) && forbidden.Contains(kwName))
-                    return true;
+                if (!string.IsNullOrEmpty(kwName))
+                    outNames.Add(kwName);
             }
-            return false;
         }
 
-        private static bool IsWhitelisted(string shaderName, List<string> whitelist)
-        {
-            if (whitelist == null) return false;
-            for (int i = 0; i < whitelist.Count; i++)
-            {
-                string sub = whitelist[i];
-                if (!string.IsNullOrEmpty(sub) && shaderName.IndexOf(sub, StringComparison.OrdinalIgnoreCase) >= 0)
-                    return true;
-            }
-            return false;
-        }
-
-        private static bool IsMobileBuildTarget(BuildTarget target)
+        public static bool IsMobileBuildTarget(BuildTarget target)
         {
             return target == BuildTarget.Android || target == BuildTarget.iOS;
         }

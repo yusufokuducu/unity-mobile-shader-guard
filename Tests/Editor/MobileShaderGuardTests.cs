@@ -1,4 +1,6 @@
+using System.Collections.Generic;
 using NUnit.Framework;
+using UnityEngine;
 using YusufOkuducu.MobileShaderGuard.Editor;
 
 namespace YusufOkuducu.MobileShaderGuard.Tests
@@ -46,8 +48,11 @@ Shader ""Custom/HeavyFoliage""
             Assert.GreaterOrEqual(audit.fp32DeclarationsCount, 10);
             Assert.AreEqual(0, audit.fp16DeclarationsCount);
             Assert.AreEqual(1, audit.alphaTestDiscardCount);
+            Assert.AreEqual(4, audit.multiCompileDirectiveCount);
+            Assert.AreEqual(3 * 3 * 4 * 4, audit.estimatedKeywordBurstRiskScore); // 144x including multi_compile_fog
             Assert.IsFalse(audit.hasSrpBatcherCBuffer);
             Assert.AreEqual(MobileShaderHazardSeverity.Critical, audit.severity);
+            Assert.Less(audit.mobileReadinessScore, 50);
         }
 
         [Test]
@@ -80,9 +85,204 @@ Shader ""Custom/CleanMobileLit""
             ShaderSourceAuditResult audit = MobileHlslStaticAnalyzer.AnalyzeShaderSource(cleanMobileShader, "Assets/CleanMobileLit.shader");
 
             Assert.IsTrue(audit.hasSrpBatcherCBuffer);
+            Assert.IsFalse(audit.hasMismatchedSrpBatcherCBuffer);
             Assert.AreEqual(0, audit.alphaTestDiscardCount);
             Assert.Greater(audit.fp16Ratio, 0.9f);
             Assert.AreEqual(MobileShaderHazardSeverity.Good, audit.severity);
+            Assert.AreEqual(100, audit.mobileReadinessScore);
+        }
+
+        [Test]
+        public void StaticAnalyzer_DetectsSrpBatcherCBufferMismatchAcrossPassesAndSvDepth()
+        {
+            const string mismatchedShader = @"
+Shader ""Custom/MismatchedPasses""
+{
+    SubShader
+    {
+        Pass
+        {
+            Name ""ForwardLit""
+            HLSLPROGRAM
+            CBUFFER_START(UnityPerMaterial)
+                half4 _BaseColor;
+                half _Smoothness;
+            CBUFFER_END
+            half4 frag(out float outDepth : SV_Depth) : SV_Target
+            {
+                outDepth = 0.5;
+                return _BaseColor;
+            }
+            ENDHLSL
+        }
+        Pass
+        {
+            Name ""ShadowCaster""
+            HLSLPROGRAM
+            CBUFFER_START(UnityPerMaterial)
+                half4 _BaseColor;
+            CBUFFER_END
+            half4 frag() : SV_Target { return 0; }
+            ENDHLSL
+        }
+    }
+}";
+
+            ShaderSourceAuditResult audit = MobileHlslStaticAnalyzer.AnalyzeShaderSource(mismatchedShader, "Assets/MismatchedPasses.shader");
+
+            Assert.IsTrue(audit.hasSrpBatcherCBuffer);
+            Assert.AreEqual(2, audit.cbufferPassCount);
+            Assert.IsTrue(audit.hasMismatchedSrpBatcherCBuffer);
+            Assert.IsTrue(audit.hasSvDepthOutput);
+            Assert.AreEqual(MobileShaderHazardSeverity.Critical, audit.severity);
+        }
+
+        [Test]
+        public void StaticAnalyzer_DetectsInLoopTextureFetchWithoutExplicitLod()
+        {
+            const string loopShader = @"
+Shader ""Custom/BlurLoop""
+{
+    SubShader
+    {
+        Pass
+        {
+            HLSLPROGRAM
+            CBUFFER_START(UnityPerMaterial)
+                half4 _Tint;
+            CBUFFER_END
+            half4 frag(half2 uv : TEXCOORD0) : SV_Target
+            {
+                half4 acc = 0;
+                for (int i = 0; i < 4; i++)
+                {
+                    acc += SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, uv);
+                    acc += SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, uv, 0);
+                }
+                return acc * _Tint;
+            }
+            ENDHLSL
+        }
+    }
+}";
+
+            ShaderSourceAuditResult audit = MobileHlslStaticAnalyzer.AnalyzeShaderSource(loopShader, "Assets/BlurLoop.shader");
+
+            Assert.AreEqual(1, audit.dynamicLoopCount);
+            Assert.AreEqual(2, audit.textureSampleCount);
+            Assert.AreEqual(1, audit.textureSampleInLoopCount); // Only non-LOD fetch flagged
+            Assert.AreEqual(MobileShaderHazardSeverity.Critical, audit.severity);
+        }
+
+        [Test]
+        public void StaticAnalyzer_IgnoresCommentsStringLiteralsAndHandlesEmptyInput()
+        {
+            ShaderSourceAuditResult emptyAudit = MobileHlslStaticAnalyzer.AnalyzeShaderSource(null, null);
+            Assert.AreEqual(MobileShaderHazardSeverity.Good, emptyAudit.severity);
+            Assert.AreEqual("<Memory>", emptyAudit.shaderName);
+
+            const string commentedOutHazards = @"
+Shader ""Custom/CommentSafe""
+{
+    Properties
+    {
+        _Prop (""float clip(x) discard ddx(x)"", Float) = 1.0
+    }
+    SubShader
+    {
+        Pass
+        {
+            HLSLPROGRAM
+            // float4 a; clip(x); discard; #pragma multi_compile A B C D E
+            /* float4 b; float4 c; float4 d; float4 e; float4 f; float4 g; float4 h; float4 i; float4 j; */
+            CBUFFER_START(UnityPerMaterial)
+                half4 _Color;
+            CBUFFER_END
+            half4 frag() : SV_Target { return _Color; }
+            ENDHLSL
+        }
+    }
+}";
+
+            ShaderSourceAuditResult audit = MobileHlslStaticAnalyzer.AnalyzeShaderSource(commentedOutHazards, "Assets/CommentSafe.shader");
+            Assert.AreEqual(0, audit.fp32DeclarationsCount);
+            Assert.AreEqual(0, audit.alphaTestDiscardCount);
+            Assert.AreEqual(0, audit.multiCompileDirectiveCount);
+            Assert.AreEqual(MobileShaderHazardSeverity.Good, audit.severity);
+        }
+
+        [Test]
+        public void StripProfile_EvaluatesSingleKeywordsPairsPassesAndWhitelistCorrectly()
+        {
+            var profile = ScriptableObject.CreateInstance<MobileShaderStripProfile>();
+            try
+            {
+                HashSet<string> forbidden = profile.BuildEffectiveForbiddenKeywordSet();
+
+                // Verify leading space bug on EDITOR_VISUALIZATION is fixed
+                Assert.IsTrue(forbidden.Contains("EDITOR_VISUALIZATION"));
+                Assert.IsFalse(forbidden.Contains(" EDITOR_VISUALIZATION"));
+
+                // 1. Whitelisted shader is never stripped even with forbidden keywords
+                bool stripWhitelisted = profile.ShouldStripVariant(
+                    "Sprites/Default",
+                    "ForwardLit",
+                    new[] { "DEBUG_DISPLAY", "_SHADOWS_SOFT" },
+                    forbidden,
+                    out _);
+                Assert.IsFalse(stripWhitelisted);
+
+                // 2. Forbidden pass (GBuffer) is stripped
+                bool stripPass = profile.ShouldStripVariant(
+                    "Universal Render Pipeline/Lit",
+                    "GBuffer",
+                    new string[0],
+                    forbidden,
+                    out string passReason);
+                Assert.IsTrue(stripPass);
+                Assert.AreEqual("ForbiddenPass:GBuffer", passReason);
+
+                // 3. Co-occurring pair (_MAIN_LIGHT_SHADOWS_CASCADE + _ADDITIONAL_LIGHT_SHADOWS)
+                profile.stripAdditionalLightShadows = false;
+                profile.stripMainLightCascadeShadows = false;
+                forbidden = profile.BuildEffectiveForbiddenKeywordSet();
+
+                bool stripCascadeAlone = profile.ShouldStripVariant(
+                    "Universal Render Pipeline/Lit",
+                    "ForwardLit",
+                    new[] { "_MAIN_LIGHT_SHADOWS_CASCADE" },
+                    forbidden,
+                    out _);
+                Assert.IsFalse(stripCascadeAlone);
+
+                bool stripBothTogether = profile.ShouldStripVariant(
+                    "Universal Render Pipeline/Lit",
+                    "ForwardLit",
+                    new[] { "_MAIN_LIGHT_SHADOWS_CASCADE", "_ADDITIONAL_LIGHT_SHADOWS" },
+                    forbidden,
+                    out string pairReason);
+                Assert.IsTrue(stripBothTogether);
+                Assert.AreEqual("ForbiddenPair:_MAIN_LIGHT_SHADOWS_CASCADE+_ADDITIONAL_LIGHT_SHADOWS", pairReason);
+            }
+            finally
+            {
+                Object.DestroyImmediate(profile);
+            }
+        }
+
+        [Test]
+        public void ReportExporters_GenerateValidMarkdownAndCsv()
+        {
+            var r = MobileHlslStaticAnalyzer.AnalyzeShaderSource(
+                @"Shader ""Custom/Test"" { SubShader { Pass { HLSLPROGRAM half4 frag() : SV_Target { return 0; } ENDHLSL } } }",
+                "Assets/Test.shader");
+
+            string csv = MobileHlslStaticAnalyzer.ExportAuditResultsToCsv(new[] { r });
+            string md = MobileHlslStaticAnalyzer.ExportAuditResultsToMarkdown(new[] { r });
+
+            StringAssert.Contains("Custom/Test", csv);
+            StringAssert.Contains("Custom/Test", md);
+            StringAssert.Contains("Mobile Shader Guard", md);
         }
     }
 }
