@@ -1,0 +1,27 @@
+{
+  "name": "com.yusufokuducu.mobile-shader-guard",
+  "version": "1.0.0",
+  "displayName": "Mobile Shader Guard: HLSL Analyzer & Variant Stripper",
+  "description": "Static HLSL/ShaderLab analyzer for mobile GPUs (detecting FP32 vs FP16 register pressure, Early-Z/HSR clip/discard hazards, SRP Batcher CBUFFER compliance) and rule-based IPreprocessShaders variant stripper.",
+  "unity": "2022.3",
+  "unityRelease": "0f1",
+  "keywords": [
+    "mobile",
+    "shader",
+    "hlsl",
+    "variant-stripper",
+    "urp",
+    "tbdr",
+    "early-z",
+    "performance"
+  ],
+  "author": {
+    "name": "Yusuf Okuducu",
+    "url": "https://github.com/yusufokuducu"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yusufokuducu/unity-mobile-shader-guard.git"
+  }
+}
